@@ -1,0 +1,2 @@
+# mysqlrecover
+auto recover mysql
