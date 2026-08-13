@@ -142,30 +142,40 @@
 
 ---
 
-## FP-04：恢复后验证
+## FP-04：恢复后验证（自动发现规则）
+
+> 📌 **ADR-10**：验证 SQL 不手写，工具自动发现业务库表验证。无需为每个实例配置。
 
 **触发方式**：恢复流程内部，实例启动后
 
 **输入**：
-- 已启动的 MySQL 实例连接信息
-- 验证规则（来自配置）：
-  - 检查 xtrabackup 日志关键字（`completed OK!`）
-  - 查询指定库 `SELECT COUNT(*) FROM db.table`
-  - 可选：期望行数 > N
+- 已启动的 MySQL 容器连接信息（127.0.0.1:13306）
+- 系统库过滤名单（默认：mysql, information_schema, performance_schema, sys, test）
 
-**处理逻辑**：
-1. grep xtrabackup 日志确认 `completed OK!`
-2. 连接 MySQL 执行验证 SQL
-3. 比对期望结果
+**处理逻辑**（自动发现）：
+1. 连接 `127.0.0.1:13306`
+2. 查所有库（`information_schema.SCHEMATA`）→ 过滤系统库
+3. 若无业务库 → **直接 PASS**（MySQL 能起来即说明 datadir 恢复成功）
+4. 若有业务库 → 选 TABLES 数量最多的库作为验证库
+5. 在验证库中，选 `TABLE_ROWS > 0` 的第一张表
+6. `SELECT COUNT(*) FROM {库}.{表}`
+7. 结果 > 0 → PASS；结果 = 0 或查询失败 → FAIL
 
-**输出**：`PASS` / `FAIL` + 证据（日志片段、查询结果）
+**输出**：
+- `PASS` / `FAIL`
+- 证据：选中的库名、表名、COUNT 结果（附诊断信息便于排查）
 
 **异常处理**：
-- 连不上 MySQL：标记 FAIL，附启动日志
-- 查询超时：FAIL
+- **连不上 MySQL / 容器启动失败**：标记 FAIL + **必须采集日志**：
+  - `docker logs {容器}` 抓取容器错误输出
+  - 检查 datadir 下 `{hostname}.err`（MySQL error log）
+  - 两份日志归档到 `/归档目录/YYYY-MM-DD/{源IP}_{版本}/error/`（FP-08）
+- **查询超时/失败**：FAIL + 附诊断
+- **验证 FAIL**：自动进重试队列（FP-05），重试 1 次仍失败则记录失败
 
 **不做**：
-- 不做业务级数据正确性校验（只验证"能起来 + 表能查"）
+- 不做业务级数据正确性校验（只验证"能起来 + 业务表能查到数据"）
+- 不做全库全表校验（只抽查一个库一张表）
 
 ---
 
