@@ -1,0 +1,106 @@
+# ===== 全局配置模板（适配 ADR-08/09/10）=====
+# 拷贝为 config.yaml 后按实际修改。
+# ⚠️ 密码/webhook 等敏感值不要写这里，通过环境变量注入（ADR-10）。
+
+# 元数据库（ADR-03：SQLite，设计兼容 MySQL）
+database:
+  url: sqlite:///data/toolkit.db           # SQLite 默认
+  # 切换 MySQL（见 docs/03-数据库设计.md 迁移指南）：
+  # url: mysql+pymysql://toolkit:pass@mysql-host:3306/toolkit?charset=utf8mb4
+
+# Docker 容器管理（FP-01, ADR-09：常驻容器池）
+docker:
+  # 常驻容器命名规则：drill-mysql-{version去点}，如 drill-mysql-8035
+  container_prefix: drill-mysql
+  # 固定端口（串行复用，不冲突）
+  drill_port: 13306
+  # datadir 挂载根目录（恢复机上）：/data/drill/{version}/datadir
+  datadir_base: /data/drill
+  # 默认镜像（按版本自动选 mysql:{version}）
+  image_template: "mysql:{version}"
+  # 支持的版本白名单
+  supported_versions:
+    - "5.7.44"
+    - "8.0.35"
+    - "8.0.36"
+
+# xtrabackup 配置（宿主机执行，ADR-09）
+xtrabackup:
+  binary_path: /usr/bin/xtrabackup
+  # xtrabackup 版本矩阵（需与 MySQL 匹配）
+  version_matrix:
+    "5.7": "percona-xtrabackup-2.4"
+    "8.0": "percona-xtrabackup-80"
+
+# 恢复目标机（ADR-01：管理机 SSH 远程控制恢复机）
+target:
+  host: 10.0.0.100                         # 恢复机 IP
+  ssh_user: root
+  ssh_port: 22
+  ssh_key_env: DRILL_SSH_KEY               # 恢复机私钥路径从环境变量读
+  # 备份拉取到恢复机的临时目录
+  tmp_backup_dir: /data/drill/tmp-backups
+
+# 备份源机（ADR-04：scp 拉取模式）
+backup:
+  source_host: 10.0.0.200                  # 备份归档所在机器
+  source_ssh_user: root
+  source_ssh_key_env: DRILL_BACKUP_SSH_KEY
+  source_root: /data/backups              # 备份源机上的备份根目录
+  # 备份目录命名规则：{source_root}/{instance}/{date}/
+  naming_pattern: "{source_root}/{instance}/{date}"
+  clean_tmp_after_drill: true              # 恢复后清理临时备份
+
+# 恢复演练（FP-03, ADR-09）
+drill:
+  max_retry: 1                             # 失败重试次数（PRD FP-05）
+  serial: true                             # 串行（ADR-05，固定单端口复用）
+  clean_datadir_before_copyback: true      # copy-back 前清空 datadir
+  dry_run_default: true                    # 默认 dry-run，--yes 才真执行
+
+# 自动验证（FP-04, ADR-10：自动发现，无需 per-instance 配置）
+verify:
+  # 过滤这些系统库，剩余视为业务库
+  exclude_system_dbs:
+    - mysql
+    - information_schema
+    - performance_schema
+    - sys
+    - test
+  # 选库策略：max_tables（表最多的库）
+  select_db_strategy: max_tables
+  # 选表策略：has_data（TABLE_ROWS > 0 的第一张表）
+  select_table_strategy: has_data
+  # 判定：COUNT > 0 即 PASS；无业务库也 PASS（MySQL 能起来即可）
+  min_count: 0
+
+# 审计日志归档（FP-08, ADR-10）
+archive:
+  root: /data/archive
+  pattern: "{root}/{date}/{instance}_{version}"
+  # 启动失败时的错误日志子目录
+  error_subdir: error
+
+# 报告（FP-06）
+report:
+  output_dir: /data/logs/reports
+
+# 通知（FP-07）
+notifiers:
+  wecom:
+    enabled: true
+    webhook_env: DRILL_WECOM_WEBHOOK       # webhook URL 从环境变量读
+    notify_on: always                      # always | on_failure
+
+# 日志
+logging:
+  level: INFO
+  file: /data/logs/toolkit.log
+  rotate_size_mb: 100
+  keep: 10
+
+# 安全（docs/04-安全设计.md）
+safety:
+  production_ip_whitelist: []              # 生产实例 IP 白名单（CIDR）
+    # - 10.0.0.0/24
+  min_disk_free_gb: 50                     # 恢复机最小剩余空间

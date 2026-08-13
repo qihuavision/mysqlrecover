@@ -1,0 +1,33 @@
+# ===== 源实例清单模板（适配 ADR-10 自动验证）=====
+# 拷贝为 instances.yaml 后填入实际实例。
+# ⚠️ 密码不要写这里！统一通过环境变量 DRILL_MYSQL_PWD 注入（ADR-10）。
+# ⚠️ 验证 SQL 无需配置！工具自动发现业务库表验证（ADR-10）。
+
+instances:
+  - name: order-db-prod-01                 # 人类可读名（唯一）
+    host: 10.0.0.11                        # 源实例 IP
+    port: 3306
+    mysql_version: "8.0.35"
+    backup_source_host: 10.0.0.200         # 备份归档所在机器 IP
+    backup_source_path: /data/backups/order-db-prod-01
+    enabled: true                          # 是否纳入演练
+
+  - name: user-db-prod-01
+    host: 10.0.0.12
+    port: 3306
+    mysql_version: "5.7.44"
+    backup_source_host: 10.0.0.200
+    backup_source_path: /data/backups/user-db-prod-01
+    enabled: true
+
+  - name: log-db-slave-07
+    host: 10.0.0.13
+    port: 3306
+    mysql_version: "8.0.35"
+    backup_source_host: 10.0.0.200
+    backup_source_path: /data/backups/log-db-slave-07
+    enabled: false                         # 暂不演练
+
+# 按这个结构继续添加上百个实例...
+# 必填字段：name, host, port, mysql_version, backup_source_host, backup_source_path
+# 可选字段：enabled（默认 true）
