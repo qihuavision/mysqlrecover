@@ -20,40 +20,40 @@
 
 ---
 
-## FP-01：MySQL 多版本管理（Docker 容器方案）
+## FP-01：MySQL 多版本管理（Docker 常驻容器池）
 
-> 📌 **ADR-08 修正**：调研后，多版本方案从"tarball 物理安装"升级为 **Docker 容器隔离**。
-> 借鉴 restore-drill 的思路：每次恢复启动对应版本的 MySQL Docker 容器，天然解决多版本共存。
+> 📌 **ADR-08 + ADR-09**：多版本方案用 Docker 容器隔离，容器常驻按版本复用，固定端口 13306。
 
 **触发方式**：恢复流程内部自动调用 / 手动 CLI（`toolkit mysql ensure --version 8.0.35`）
 
 **输入**：
 - 版本号（如 `8.0.35`、`5.7.44`）
-- 容器名前缀（默认 `drill-mysql-{version}`）
-- datadir 挂载路径（恢复时挂载，供 xtrabackup copy-back）
+- 容器名规则：`drill-mysql-{version}`（如 `drill-mysql-8035`）
+- datadir 挂载路径：`/data/drill/{version}/datadir`
+- 固定端口：`13306`（host 网络，串行复用，不冲突）
 
 **处理逻辑**：
 1. 检查恢复机 Docker 是否可用（前置检查）
-2. 检查本地是否已有该版本镜像（`docker images mysql:{version}`）
-3. 不存在则 `docker pull mysql:{version}`（从官方仓库，含重试）
-4. 启动容器：`docker run -d --name {container} -v {datadir}:/var/lib/mysql mysql:{version}`
-5. 工具能通过 `docker start/stop/exec` 控制该容器
-6. 记录到元数据库（容器ID、版本、状态）
+2. 检查常驻容器 `drill-mysql-{version}` 是否已存在
+3. 不存在则创建：
+   - 检查本地镜像 `mysql:{version}`，不存在则 `docker pull`（含重试）
+   - `docker run -d --network host --name drill-mysql-{version} -v /data/drill/{version}/datadir:/var/lib/mysql mysql:{version} --port=13306`
+4. 已存在则 `docker start`（若未运行）
+5. 记录到元数据库（容器名、版本、状态）
 
 **输出**：
-- 可用的 MySQL Docker 容器（对应版本）
-- 可被启停/执行命令的控制能力（经 `docker exec`）
+- 可用的常驻 MySQL 容器（对应版本，端口 13306）
+- 可被 `docker start/stop` 控制
 
 **异常处理**：
-- Docker 未安装/未启动：明确报错，提示前置安装（恢复机必须预装 Docker）
-- `docker pull` 失败：重试 3 次（网络问题），仍失败告警并跳过
-- 端口冲突：自动分配空闲端口或报错
-- 版本不受支持：明确报错（支持的版本白名单）
+- Docker 未安装/未启动：明确报错（恢复机必须预装 Docker + xtrabackup）
+- `docker pull` 失败：重试 3 次，仍失败告警并跳过该版本
+- 版本不受支持：明确报错（版本白名单）
 
 **不做**：
-- 不用 yum/apt 安装 MySQL（避免污染系统）
-- 不物理解压 tarball 到 `/opt/mysql-versions/`（已废弃此方案，改用 Docker）
-- 不做 MySQL 集群/复制（单容器即可满足恢复演练）
+- 不物理解压 tarball（已废弃 ADR-02 方案）
+- 不做容器删除（常驻池，只 start/stop 不 rm）
+- 不做集群/复制
 
 ---
 
@@ -103,23 +103,27 @@
 
 ## FP-03：自动化恢复演练编排（🔥 核心）
 
+> 📌 **ADR-09**：恢复流程基于 Docker 常驻容器 + 宿主机 xtrabackup + 固定端口 13306 串行复用。
+
 **触发方式**：手动 CLI（`toolkit drill run`）/ Web 点击 / 定时
 
 **输入**：
-- 恢复目标主机（一台空服务器，工具可管理它）
+- 恢复目标主机（已预装 Docker + xtrabackup）
 - 要演练的源实例集合（全部 / 指定列表）
 - 执行模式：立即 / 定时（cron 表达式）
 - 验证规则（查哪个库、哪张表、期望结果）
 
-**处理逻辑**：
-1. 收集所有待演练备份，按 **MySQL 版本升序、IP 升序** 排队（同版本连续恢复，减少重装）
-2. 对队首任务：
-   - 若当前目标机 MySQL 版本 ≠ 备份版本 → 调用 FP-01 安装对应版本
-   - 确认工具能 start/stop 该 MySQL 实例
-3. 执行恢复：`xtrabackup --prepare` → `--copy-back` → `chown datadir` → 启动实例 → 登录验证（FP-04）
-4. 验证通过 → 归档日志（FP-08）→ 清理 datadir → 取下一个任务
-5. 同版本继续恢复（跳过重装）；不同版本先重装再恢复
-6. 全部完成 → 生成报告（FP-06）+ 通知（FP-07）
+**处理逻辑**（对齐 ADR-09 的标准流程）：
+1. 收集所有待演练备份，按 **MySQL 版本升序、IP 升序** 排队（同版本连续恢复，复用常驻容器）
+2. 对队首任务，执行 ADR-09 标准 12 步：
+   - 确保目标版本常驻容器存在（FP-01）
+   - 停其他版本容器 → 启目标版本容器 → 停目标版本容器（copy-back 前置）
+   - 清空 `/data/drill/{version}/datadir`
+   - 宿主机：`xtrabackup --prepare` → `--copy-back` → `chown 999:999`
+   - 启目标版本容器 → 连 `127.0.0.1:13306` 验证（FP-04）
+   - 验证通过 → 归档日志（FP-08）
+3. 取下一个任务：同版本 → 回到"停容器+清datadir"；不同版本 → 切换常驻容器
+4. 全部完成 → 生成报告（FP-06）+ 通知（FP-07）
 
 **输出**：
 - 每个实例的恢复结果（成功/失败/重试中）
@@ -129,10 +133,12 @@
 - 单实例恢复失败 → 进入重试队列，重试 1 次（FP-05）
 - 重试仍失败 → 记录失败原因，继续下一个，不阻塞整体
 - 目标机磁盘不足 → 预检查，不足则告警停止
+- 容器启动失败 → 记录 docker logs，标记失败
 
 **不做**：
 - 不做增量恢复（本期）
-- 不并发在同一台目标机恢复多个实例（串行，避免 datadir 冲突）—— 多目标机并发是 P2
+- 不并发在同一台目标机恢复多个实例（串行，固定单端口 13306）—— 多目标机并发是 P2
+- 不删除常驻容器（只 start/stop，容器池保留）
 
 ---
 
