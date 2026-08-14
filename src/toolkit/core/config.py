@@ -60,6 +60,9 @@ class DockerConfig(BaseModel):
 class XtrabackupConfig(BaseModel):
     binary_path: str = "/usr/bin/xtrabackup"
     version_matrix: dict[str, str] = Field(default_factory=dict)
+    # 版本→二进制路径映射（Sprint 5：多版本 xtrabackup 共存）
+    # 如 {"8.0": "/usr/bin/xtrabackup", "5.7": "/usr/bin/xtrabackup24"}
+    binary_matrix: dict[str, str] = Field(default_factory=dict)
 
 
 class TargetConfig(BaseModel):
@@ -90,7 +93,8 @@ class BackupConfig(BaseModel):
 
 class DrillConfig(BaseModel):
     max_retry: int = 1
-    serial: bool = True
+    serial: bool = True                    # 同版本组内串行（datadir 唯一，固定不变）
+    parallel: bool = True                  # 跨版本并行（Sprint 5：每版本独立端口同时恢复）
     clean_datadir_before_copyback: bool = True
     dry_run_default: bool = True
 

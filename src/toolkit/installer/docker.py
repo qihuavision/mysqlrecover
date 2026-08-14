@@ -82,12 +82,19 @@ class DockerInstaller:
 
     # ---------- 确保容器存在（核心方法，FP-01）----------
 
-    def ensure_container(self, version: str, dry_run: bool = False) -> str:
+    def ensure_container(self, version: str, dry_run: bool = False, port: int | None = None) -> str:
         """确保某版本常驻容器存在。不存在则创建。返回容器名。
 
         幂等：已存在则直接返回，不重复创建。
+
+        Args:
+            version: MySQL 版本
+            dry_run: 只打印
+            port: 容器监听端口（Sprint 5 多版本并行：每版本独立端口；
+                  不传则用默认 drill_port）
         """
         self._check_version(version)
+        use_port = port or self.drill_port
         name = self.container_name(version)
         datadir = self.datadir(version)
         image = self.image(version)
@@ -96,14 +103,14 @@ class DockerInstaller:
         info = self.inspect(name)
         if info.exists:
             logger.info("容器 %s 已存在（%s），跳过创建", name, info.status)
-            self._upsert_db_record(version, name, image, datadir, info.status)
+            self._upsert_db_record(version, name, image, datadir, info.status, use_port)
             return name
 
         if dry_run:
-            logger.info("[dry-run] 将创建容器 %s（镜像 %s，端口 %d）", name, image, self.drill_port)
+            logger.info("[dry-run] 将创建容器 %s（镜像 %s，端口 %d）", name, image, use_port)
             return name
 
-        logger.info("创建容器 %s（镜像 %s）", name, image)
+        logger.info("创建容器 %s（镜像 %s，端口 %d）", name, image, use_port)
         # 1. 创建 datadir 目录
         self.executor.run_checked(f"mkdir -p {datadir}")
         # 2. docker run（联调验证过的参数，见交接文档联调细节）
@@ -114,7 +121,7 @@ class DockerInstaller:
             f"docker run -d --network host --name {name} "
             f"-v {datadir}:/var/lib/mysql "
             f"--restart=no "
-            f"{image} --port={self.drill_port} --mysqlx=0 "
+            f"{image} --port={use_port} --mysqlx=0 "
             f"--skip-log-bin "
             f"--default-authentication-plugin=mysql_native_password"
         )
@@ -127,41 +134,44 @@ class DockerInstaller:
         self.executor.run(f"docker stop {name}")
 
         # 4. 记录到元数据库
-        self._upsert_db_record(version, name, image, datadir, "created")
-        logger.info("容器 %s 创建完成（stopped 状态）", name)
+        self._upsert_db_record(version, name, image, datadir, "created", use_port)
+        logger.info("容器 %s 创建完成（端口 %d，stopped 状态）", name, use_port)
         return name
 
     # ---------- 容器启停 ----------
 
-    def start(self, version: str, wait_ready: bool = True) -> None:
+    def start(self, version: str, wait_ready: bool = True, port: int | None = None) -> None:
         """启动某版本容器。
 
         Args:
             wait_ready: 是否等待 MySQL TCP 端口就绪（联调发现需 35-40 秒）。
                         恢复流程中 copy-back 前的 start 不需要等待（马上要 stop）。
+            port: MySQL 监听端口（多版本并行时每版本不同，不传用默认）
         """
         name = self.container_name(version)
-        logger.info("启动容器 %s", name)
+        use_port = port or self.drill_port
+        logger.info("启动容器 %s（端口 %d）", name, use_port)
         res = self.executor.run(f"docker start {name}")
         if not res.ok:
             raise InstallError(f"启动容器 {name} 失败: {res.stderr}")
         self._update_status(version, "running")
         if wait_ready:
-            self.wait_ready(version)
+            self.wait_ready(version, port=use_port)
 
-    def wait_ready(self, version: str, timeout: int = 60) -> bool:
+    def wait_ready(self, version: str, timeout: int = 60, port: int | None = None) -> bool:
         """等待 MySQL TCP 端口就绪（联调细节：ping 假就绪，TCP 监听更晚）。
 
         用 docker exec 在容器内跑 mysqladmin ping（TCP 方式）。
         """
         name = self.container_name(version)
+        use_port = port or self.drill_port
         import time
 
-        logger.info("等待 %s MySQL 就绪（最多 %d 秒）...", name, timeout)
+        logger.info("等待 %s MySQL 就绪（端口 %d，最多 %d 秒）...", name, use_port, timeout)
         for i in range(timeout // 3):
             # 用 TCP 方式 ping（比 socket 更可靠反映真实就绪状态）
             res = self.executor.run(
-                f"docker exec {name} mysqladmin ping -h127.0.0.1 -P{self.drill_port} "
+                f"docker exec {name} mysqladmin ping -h127.0.0.1 -P{use_port} "
                 f"--silent 2>/dev/null"
             )
             if res.ok:
@@ -253,7 +263,8 @@ class DockerInstaller:
     # ---------- 元数据库操作 ----------
 
     def _upsert_db_record(
-        self, version: str, name: str, image: str, datadir: str, status: str
+        self, version: str, name: str, image: str, datadir: str, status: str,
+        port: int | None = None,
     ) -> None:
         """新增或更新 mysql_containers 记录。"""
         from datetime import datetime, timezone
@@ -265,13 +276,15 @@ class DockerInstaller:
             if record:
                 record.status = status
                 record.updated_at = now
+                if port:
+                    record.drill_port = port
             else:
                 record = MysqlContainer(
                     mysql_version=version,
                     container_name=name,
                     docker_image=image,
                     datadir_path=datadir,
-                    drill_port=self.drill_port,
+                    drill_port=port or self.drill_port,
                     status=status,
                 )
                 session.add(record)
@@ -282,9 +295,9 @@ class DockerInstaller:
         finally:
             session.close()
 
-    def _update_status(self, version: str, status: str) -> None:
+    def _update_status(self, version: str, status: str, port: int | None = None) -> None:
         """仅更新状态字段。"""
         self._upsert_db_record(
             version, self.container_name(version), self.image(version),
-            self.datadir(version), status,
+            self.datadir(version), status, port,
         )

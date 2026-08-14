@@ -78,6 +78,34 @@ class BackupLocator:
                 info[key.strip()] = value.strip()
         return info
 
+    def detect_mysql_version(self, backup_path: str) -> str | None:
+        """从备份文件自动检测 MySQL 版本（Sprint 5）。
+
+        优先读 xtrabackup_info 的 server_version 行（格式：
+        server_version = 8.0.35），降级读 xtrabackup_checkpoints。
+
+        Returns:
+            版本字符串（如 '8.0.35'），检测失败返回 None
+        """
+        # 1. xtrabackup_info（首选：含 server_version）
+        res = self.executor.run(f"cat {backup_path}/xtrabackup_info 2>/dev/null")
+        if res.ok:
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("server_version"):
+                    # 格式：server_version = 8.0.35
+                    parts = line.split("=", 1)
+                    if len(parts) == 2:
+                        version = parts[1].strip()
+                        # 校验格式 x.y.z
+                        import re
+                        if re.match(r"^\d+\.\d+\.\d+", version):
+                            logger.info("备份 %s 检测到版本: %s", backup_path, version)
+                            return version
+        # 2. 降级：备份目录名猜（少见场景）
+        logger.warning("无法从 xtrabackup_info 检测 %s 的版本", backup_path)
+        return None
+
     def get_backup_size(self, backup_path: str) -> int:
         """获取备份目录大小（字节）。"""
         res = self.executor.run(f"du -sb {backup_path} 2>/dev/null | cut -f1")
