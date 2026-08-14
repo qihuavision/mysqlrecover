@@ -1,0 +1,46 @@
+{# 恢复演练报告模板（Jinja2）。数据来自 Orchestrator.DrillResult.task_results。 #}
+# MySQL 恢复演练报告
+
+- 批次：#{{ run_id }}
+- 生成时间：{{ generated_at }}
+- 目标主机：{{ target_host }}
+- 执行人：{{ operator }}
+
+## 汇总
+
+| 指标 | 数值 |
+|---|---|
+| 实例总数 | {{ total }} |
+| ✅ 成功 | {{ success }} |
+| ❌ 失败（最终） | {{ failed }} |
+| 🔄 重试过 | {{ retried }} |
+| ⏭️ 跳过 | {{ skipped }} |
+| 总耗时 | {{ duration_sec }} 秒 |
+| 成功率 | {{ "%.1f"|format(success_rate) }}% |
+
+## 明细
+
+| # | 实例 | 版本 | 状态 | 尝试 | 验证库.表 | COUNT | 耗时 | 失败原因 |
+|---|---|---|---|---|---|---|---|---|
+{% for t in tasks %}
+| {{ loop.index }} | {{ t.instance }} | {{ t.version }} | {{ t.status }} | {{ t.attempt }} | {{ t.verify_db }}.{{ t.verify_table }} | {{ t.verify_count if t.verify_count is not none else '-' }} | {{ t.duration_sec }}s | {{ (t.error or '')[:60] }} |
+{% endfor %}
+
+## 验证方法
+
+- 自动发现（ADR-10）：过滤系统库 → 表最多的业务库 → 有数据的表 → `COUNT(*) > 0` 即 PASS
+- 审计日志：`{{ archive_root }}/{{ date }}/{实例}_{版本}/`
+
+{% if failed > 0 %}
+## ⚠️ 失败实例需人工跟进
+
+{% for t in tasks if t.status == 'FAILED_FINAL' %}
+- {{ t.instance }}（{{ t.version }}）：{{ t.error }}
+{% endfor %}
+{% else %}
+## ✅ 全部恢复成功
+{% endif %}
+
+---
+
+*本报告由 mysqlrecover 工具自动生成*
