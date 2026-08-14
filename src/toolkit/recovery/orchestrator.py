@@ -34,6 +34,7 @@ class DrillResult:
     """一次演练的整体结果。"""
 
     run_id: int = 0
+    target_host: str = ""
     total: int = 0
     success: int = 0
     failed: int = 0
@@ -44,17 +45,23 @@ class DrillResult:
 
 
 class Orchestrator:
-    """恢复演练编排引擎（Sprint 2 实现）。"""
+    """恢复演练编排引擎（Sprint 2 实现，Sprint 3 加报告+通知）。"""
 
     def __init__(
         self,
         task_runner: RecoveryTaskRunner,
         queue: TaskQueue | None = None,
         max_retry: int = 1,
+        reporter=None,  # MarkdownReporter，None 则不出报告
+        notifier=None,  # WeComNotifier，None 则不发通知
+        archive_root: str = "",
     ):
         self.task_runner = task_runner
         self.queue = queue or TaskQueue(max_retry=max_retry)
         self.max_retry = max_retry
+        self.reporter = reporter
+        self.notifier = notifier
+        self.archive_root = archive_root
 
     # ---------- 主入口 ----------
 
@@ -89,7 +96,7 @@ class Orchestrator:
         else:
             run_id = self._create_run(target_host, len(instances))
 
-        result = DrillResult(run_id=run_id, total=len(instances))
+        result = DrillResult(run_id=run_id, target_host=target_host, total=len(instances))
 
         # 2. 新批次：定位备份 + 建队列
         if not resume_run_id:
@@ -146,9 +153,10 @@ class Orchestrator:
 
             result.task_results.append(self._task_to_dict(task, inst))
 
-        # 4. 收尾：更新批次
+        # 4. 收尾：更新批次 + 报告 + 通知
         result.duration_sec = int((datetime.now(timezone.utc) - start).total_seconds())
         self._finish_run(run_id, result)
+        self._report_and_notify(result)
         return result
 
     # ---------- 内部方法 ----------
@@ -268,6 +276,27 @@ class Orchestrator:
             "error": (task.error_msg or "")[:200],
         }
 
+    def _report_and_notify(self, result: DrillResult) -> None:
+        """出报告 + 发通知（Sprint 3）。失败不阻塞主流程。"""
+        report_path = ""
+        # 1. Markdown 报告
+        if self.reporter:
+            try:
+                report_path = str(self.reporter.render(result, archive_root=self.archive_root))
+            except Exception as e:
+                logger.error("报告生成失败（不影响演练结果）: %s", e, exc_info=True)
+
+        # 2. 企业微信通知
+        if self.notifier:
+            try:
+                if self.notifier.should_notify(result.failed):
+                    summary = self.reporter.summarize_markdown(result) if self.reporter else ""
+                    if report_path:
+                        summary += f"\n\n📄 报告：`{report_path}`"
+                    self.notifier.send("MySQL 恢复演练", summary)
+            except Exception as e:
+                logger.error("通知发送失败（不影响演练结果）: %s", e, exc_info=True)
+
     def _dry_run(self, target_host: str, instances: list[Instance]) -> DrillResult:
         """dry-run：只打印执行计划。"""
         sorted_instances = sorted(instances, key=self.queue.sort_key)
@@ -275,6 +304,7 @@ class Orchestrator:
         for i, inst in enumerate(sorted_instances, 1):
             logger.info("[dry-run] %d. %s (%s) 备份源=%s", i, inst.name, inst.mysql_version, inst.backup_source_path)
         return DrillResult(
+            target_host=target_host,
             total=len(instances),
             task_results=[
                 {"instance": i.name, "version": i.mysql_version, "status": "DRY_RUN"}
