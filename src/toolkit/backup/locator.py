@@ -90,16 +90,17 @@ class BackupLocator:
         # 1. xtrabackup_info（首选：含 server_version）
         res = self.executor.run(f"cat {backup_path}/xtrabackup_info 2>/dev/null")
         if res.ok:
+            import re
             for line in res.stdout.splitlines():
                 line = line.strip()
                 if line.startswith("server_version"):
-                    # 格式：server_version = 8.0.35
+                    # 格式：server_version = 8.0.35（5.7 可能带 -log 等后缀）
                     parts = line.split("=", 1)
                     if len(parts) == 2:
-                        version = parts[1].strip()
-                        # 校验格式 x.y.z
-                        import re
-                        if re.match(r"^\d+\.\d+\.\d+", version):
+                        raw = parts[1].strip()
+                        m = re.match(r"^(\d+\.\d+\.\d+)", raw)
+                        if m:
+                            version = m.group(1)  # 截掉 -log 等后缀
                             logger.info("备份 %s 检测到版本: %s", backup_path, version)
                             return version
         # 2. 降级：备份目录名猜（少见场景）

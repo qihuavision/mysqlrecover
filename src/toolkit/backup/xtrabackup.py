@@ -40,9 +40,24 @@ class Xtrabackup:
 
         匹配规则：取 major.minor（如 8.0.35 → 8.0）在矩阵中查；
         未配置则回退默认 binary。
+
+        矩阵值支持两种形式：
+        - 路径："/usr/bin/xtrabackup"（宿主机直接跑）
+        - 容器："docker:IMAGE"（宿主机 glibc 不够时用容器跑，Sprint 6）
         """
         major_minor = ".".join(mysql_version.split(".")[:2])
         return self.binary_matrix.get(major_minor, self.binary)
+
+    def _build_cmd(self, binary: str, args: str) -> str:
+        """构造最终命令。docker: 前缀 → 容器内跑（挂载 /data）。
+
+        --user 0: root 跑（datadir 属主 999，容器默认用户无权读）
+        --network host: 备份时连本机 MySQL（prepare 不需要但统一无害）
+        """
+        if binary.startswith("docker:"):
+            image = binary[len("docker:"):]
+            return f"docker run --rm --user 0 --network host -v /data:/data {image} xtrabackup {args}"
+        return f"{binary} {args}"
 
     def prepare(self, backup_path: str, log_file: str | None = None, mysql_version: str = "") -> str:
         """xtrabackup --prepare --target-dir=<backup_path>
@@ -64,7 +79,7 @@ class Xtrabackup:
         else:
             log_redirect = " 2>&1"
         binary = self.binary_for(mysql_version)
-        cmd = f"{binary} --prepare --target-dir={backup_path}{log_redirect}"
+        cmd = self._build_cmd(binary, f"--prepare --target-dir={backup_path}{log_redirect}")
         logger.info("xtrabackup prepare（%s）: %s", mysql_version, backup_path)
         res = self.executor.run(cmd, timeout=3600)
         # 即使有重定向，stdout 仍可能捕获输出（取决于 executor 实现）
@@ -93,10 +108,9 @@ class Xtrabackup:
         else:
             log_redirect = " 2>&1"
         binary = self.binary_for(mysql_version)
-        cmd = (
-            f"{binary} --copy-back "
-            f"--target-dir={backup_path} "
-            f"--datadir={datadir}{log_redirect}"
+        cmd = self._build_cmd(
+            binary,
+            f"--copy-back --target-dir={backup_path} --datadir={datadir}{log_redirect}",
         )
         logger.info("xtrabackup copy-back -> %s", datadir)
         res = self.executor.run(cmd, timeout=3600)

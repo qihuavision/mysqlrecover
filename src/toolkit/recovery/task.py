@@ -116,6 +116,10 @@ class RecoveryTaskRunner:
             if dry_run:
                 return self._dry_run(mysql_version, backup_remote_path, instance_name, container)
 
+            # 版本铁闸：验证时先确认连的是期望版本的实例（防端口占用假成功，Sprint 6）
+            if hasattr(self.verifier, "set_expected_version"):
+                self.verifier.set_expected_version(mysql_version)
+
             # 归档目录
             self.executor.run_checked(f"mkdir -p {log_dir}")
 

@@ -102,9 +102,19 @@ class DockerInstaller:
         # 检查容器是否已存在
         info = self.inspect(name)
         if info.exists:
-            logger.info("容器 %s 已存在（%s），跳过创建", name, info.status)
-            self._upsert_db_record(version, name, image, datadir, info.status, use_port)
-            return name
+            # 端口一致性校验（Sprint 6）：容器端口是创建时固化的，
+            # 若与本次期望端口不一致（如历史单组模式建的）→ 删了重建
+            db_port = self._get_registered_port(version)
+            if db_port and db_port != use_port:
+                logger.info(
+                    "容器 %s 登记端口 %d 与期望端口 %d 不一致，重建容器",
+                    name, db_port, use_port,
+                )
+                self.executor.run(f"docker rm -f {name}")
+            else:
+                logger.info("容器 %s 已存在（%s），跳过创建", name, info.status)
+                self._upsert_db_record(version, name, image, datadir, info.status, use_port)
+                return name
 
         if dry_run:
             logger.info("[dry-run] 将创建容器 %s（镜像 %s，端口 %d）", name, image, use_port)
@@ -113,17 +123,19 @@ class DockerInstaller:
         logger.info("创建容器 %s（镜像 %s，端口 %d）", name, image, use_port)
         # 1. 创建 datadir 目录
         self.executor.run_checked(f"mkdir -p {datadir}")
-        # 2. docker run（联调验证过的参数，见交接文档联调细节）
-        #    --skip-log-bin: 避免 xtrabackup 拷 binlog 失败
-        #    --default-authentication-plugin=mysql_native_password: 避免 caching_sha2 认证问题
-        #    --mysqlx=0: 关闭 X 协议（不需要）
+        # 2. docker run（联调验证过的参数；按版本定制，Sprint 6 支持 5.7）
+        #    --skip-log-bin: 避免 xtrabackup 拷 binlog 失败（5.7/8.0 通用）
+        #    8.0 专属: --mysqlx=0（关 X 协议）
+        #              --default-authentication-plugin=mysql_native_password（避免 caching_sha2）
+        #    5.7 天生 native password，且不认识上面两个 8.0 参数 → 不加
+        major_minor = ".".join(version.split(".")[:2])
+        extra_args = "--mysqlx=0 --default-authentication-plugin=mysql_native_password" \
+            if major_minor == "8.0" else ""
         cmd = (
             f"docker run -d --network host --name {name} "
             f"-v {datadir}:/var/lib/mysql "
             f"--restart=no "
-            f"{image} --port={use_port} --mysqlx=0 "
-            f"--skip-log-bin "
-            f"--default-authentication-plugin=mysql_native_password"
+            f"{image} --port={use_port} --skip-log-bin {extra_args}"
         )
         try:
             self.executor.run_checked(cmd)
@@ -301,3 +313,12 @@ class DockerInstaller:
             version, self.container_name(version), self.image(version),
             self.datadir(version), status, port,
         )
+
+    def _get_registered_port(self, version: str) -> int | None:
+        """查询表内登记的容器端口（无则 None）。"""
+        session = get_session_ctx()
+        try:
+            rec = session.query(MysqlContainer).filter_by(mysql_version=version).first()
+            return rec.drill_port if rec else None
+        finally:
+            session.close()
