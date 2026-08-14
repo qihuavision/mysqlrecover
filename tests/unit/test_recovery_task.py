@@ -75,24 +75,19 @@ class TestRecoveryTaskSuccess:
         assert result.container_name == "drill-mysql-8035"
         assert result.verify_count == 42
         # 验证调用顺序：ensure → start(wait_ready=False) → stop → clean → prepare → copyback → chown → start(wait_ready=True) → verify
-        installer.ensure_container.assert_called_once_with("8.0.35")
+        installer.ensure_container.assert_called_once_with("8.0.35", port=None)
         # start 被调用两次：第一次 wait_ready=False（步骤3-4），第二次 wait_ready=True（步骤9）
         assert installer.start.call_count == 2
-        installer.start.assert_called_with("8.0.35", wait_ready=True)
+        installer.start.assert_called_with("8.0.35", wait_ready=True, port=None)
         installer.clean_datadir.assert_called_once_with("8.0.35")
         installer.chown_datadir.assert_called_once_with("8.0.35")
         xtrabackup.prepare.assert_called_once()
         xtrabackup.copy_back.assert_called_once()
         verifier.verify.assert_called_once()
 
-    def test_stops_other_running_containers(self, runner):
-        """步骤 2：应停止其他 running 容器。"""
+    def test_does_not_stop_other_version_containers(self, runner):
+        """Sprint 5：跨版本并行 —— 不应停止其他版本的容器（只有自己版本互斥）。"""
         r, installer, xtrabackup, verifier, _ = runner
-        # 模拟有另一个 running 容器
-        from toolkit.installer.docker import ContainerInfo
-        installer.list_containers.return_value = [
-            ContainerInfo(name="drill-mysql-5744", version="5.7.44", status="running", exists=True),
-        ]
         verifier.verify.return_value = VerifyResult(passed=True, detail="ok")
 
         r.execute(
@@ -101,7 +96,9 @@ class TestRecoveryTaskSuccess:
             instance_name="db1",
             backup_source_host="10.0.0.9",
         )
-        installer.stop_by_name.assert_called_with("drill-mysql-5744")
+        # 只停自己版本（8.0.35），不碰其他版本（5.7.44 由它自己的组管理）
+        installer.stop.assert_called_with("8.0.35")
+        installer.stop_by_name.assert_not_called()
 
 
 class TestRecoveryTaskFailure:
