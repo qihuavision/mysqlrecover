@@ -1,0 +1,37 @@
+version: "3.8"
+
+services:
+  toolkit:
+    build: .
+    container_name: mysql-recovery-toolkit
+    volumes:
+      # 配置（config.yaml + instances.yaml，密码走环境变量不写文件）
+      - ./config:/app/config:ro
+      # 元数据库（SQLite 持久化）
+      - ./data:/app/data
+      # 日志 + 报告
+      - ./logs:/app/logs
+      # SSH 私钥（连恢复机/备份源机，ADR-01）
+      - ~/.ssh:/app/ssh:ro
+    environment:
+      - TZ=Asia/Shanghai
+      # 恢复出的 MySQL root 密码（必填）
+      - DRILL_MYSQL_PWD=${DRILL_MYSQL_PWD}
+      # 企业微信 webhook（可选）
+      - DRILL_WECOM_WEBHOOK=${DRILL_WECOM_WEBHOOK:-}
+    # 按需覆盖命令，如：
+    #   docker compose run toolkit drill run --target 192.168.1.15 --all --yes
+    restart: "no"
+
+# ===== 使用示例 =====
+# 交互查看帮助：
+#   docker compose run --rm toolkit --help
+#
+# 环境体检：
+#   docker compose run --rm toolkit config doctor --target 192.168.1.15
+#
+# 恢复演练：
+#   docker compose run --rm toolkit drill run --target 192.168.1.15 --all --yes
+#
+# 备份：
+#   docker compose run --rm toolkit backup trigger --instance xxx --yes
