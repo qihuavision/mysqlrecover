@@ -33,22 +33,39 @@ class PortAllocator:
         except ValueError:
             return (0,)
 
-    def assign(self, versions: list[str]) -> dict[str, int]:
-        """为一组版本分配端口（幂等：重复调用结果一致）。
+    def assign(self, versions: list[str], occupied_ports: dict[str, int] | None = None) -> dict[str, int]:
+        """为一组版本（或 redo 代）分配端口。
 
-        按版本升序依次分配 base_port + index。
-        已分配过的版本保持原端口不变。
+        Args:
+            versions: 本次需要的版本/代列表
+            occupied_ports: 已存在的分配（如 {era/版本: port}，来自
+                            mysql_containers 表的历史登记 + running 容器实际占用）。
+                            已有的保持不变（全局一致，防历史容器端口冲突），
+                            新的从未用的端口里按序分配。
+
+        幂等：重复调用结果一致。
         """
-        # 合并已分配的 + 新版本，统一排序后分配
-        all_versions = set(self._ports.keys()) | set(versions)
-        sorted_versions = sorted(all_versions, key=self._version_key)
+        existing = dict(occupied_ports or {})
+        used_ports = set(existing.values())
 
-        new_alloc: dict[str, int] = {}
-        for idx, ver in enumerate(sorted_versions):
-            new_alloc[ver] = self.base_port + idx
+        # 保留历史分配（含未在本次 versions 里的）
+        result: dict[str, int] = dict(existing)
+        # 1. 已有分配保持不变
+        for ver in versions:
+            if ver in existing:
+                result[ver] = existing[ver]
 
-        self._ports = new_alloc
-        logger.info("端口分配: %s", self._ports)
+        # 2. 新的从未占用端口按序分配
+        next_port = self.base_port
+        for ver in sorted(set(versions) - set(result.keys()), key=self._version_key):
+            while next_port in used_ports:
+                next_port += 1
+            result[ver] = next_port
+            used_ports.add(next_port)
+            next_port += 1
+
+        self._ports = result
+        logger.info("端口分配: %s（已有占用: %s）", self._ports, existing or "无")
         return dict(self._ports)
 
     def get(self, version: str) -> int | None:
@@ -56,9 +73,9 @@ class PortAllocator:
         return self._ports.get(version)
 
     def get_or_assign(self, version: str) -> int:
-        """查询端口，未分配则动态分配。"""
+        """查询端口，未分配则动态分配（保留已分配的）。"""
         if version not in self._ports:
-            self.assign([version])
+            self.assign([version], occupied_ports=self._ports)
         return self._ports[version]
 
     @property

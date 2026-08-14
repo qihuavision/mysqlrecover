@@ -21,6 +21,11 @@ from toolkit.core.db import get_session_ctx
 from toolkit.core.logger import get_logger
 from toolkit.core.models import Backup, DrillRun, Instance, RecoveryTask, TaskStatus
 from toolkit.core.port_allocator import PortAllocator
+from toolkit.core.version_compat import (
+    check_restore_safe,
+    container_for_versions,
+    redo_era,
+)
 from toolkit.recovery.queue import TaskQueue
 from toolkit.recovery.task import RecoveryTaskRunner, TaskResult
 
@@ -54,7 +59,7 @@ class _PlannedTask:
     instance: Instance
     backup_id: int
     local_backup_path: str   # 恢复机本地路径
-    version: str             # 自动检测出的版本（覆盖配置）
+    version: str             # 自动检测出的备份版本（覆盖配置）
 
 
 class Orchestrator:
@@ -119,42 +124,50 @@ class Orchestrator:
         plans, skipped = self._plan(instances)
         result.skipped = skipped
 
-        # ---- 阶段 2：端口分配 ----
-        versions = sorted({p.version for p in plans})
+        # ---- 阶段 2：redo 兼容组划分 + 端口分配（Sprint 6）----
+        # 同 redo 代共用一个容器（组内最高版本，升级安全），跨代并行
+        era_groups: dict[str, list[str]] = defaultdict(list)
+        for p in plans:
+            era_groups[redo_era(p.version)].append(p.version)
+        era_container = {era: container_for_versions(vs) for era, vs in era_groups.items()}
+
+        # 端口分配：注入历史登记的容器端口（防与遗留 running 容器冲突，Sprint 6）
+        occupied = self._existing_era_ports()
         allocator = PortAllocator(base_port=self._base_port())
-        ports = allocator.assign(versions)
-        result.version_ports = ports
-        logger.info("版本分组: %s → 端口 %s", versions, ports)
+        ports = allocator.assign(list(era_container.keys()), occupied_ports=occupied)
+        result.version_ports = {era: {"port": ports[era], "container": era_container[era]}
+                                for era in era_container}
+        logger.info("redo 兼容分组: %s → 容器/端口 %s",
+                    {e: sorted(set(vs)) for e, vs in era_groups.items()},
+                    result.version_ports)
 
         # ---- 阶段 3：登记任务 ----
         tasks = self._register_tasks(run_id, plans)
 
-        # ---- 阶段 4：执行（版本分组）----
+        # ---- 阶段 4：执行（redo 代分组，组内串行 + 兼容校验）----
         groups: dict[str, list] = defaultdict(list)
         for plan, task in zip(plans, tasks):
-            groups[plan.version].append((plan, task))
+            groups[redo_era(plan.version)].append((plan, task))
 
         group_results: list[dict] = []
         if len(groups) == 1 or not self.parallel or not self.runner_factory:
-            # 单版本 / 关闭并行：主线程串行跑所有组
-            for version, items in groups.items():
+            for era, items in groups.items():
                 group_results.extend(
-                    self._run_group(version, items, ports[version])
+                    self._run_group(era, era_container[era], items, ports[era])
                 )
         else:
-            # 多版本并行：每版本一个线程
             with ThreadPoolExecutor(max_workers=len(groups)) as pool:
                 futures = {
-                    pool.submit(self._run_group, ver, items, ports[ver]): ver
-                    for ver, items in groups.items()
+                    pool.submit(self._run_group, era, era_container[era], items, ports[era]): era
+                    for era, items in groups.items()
                 }
                 for fut in as_completed(futures):
-                    ver = futures[fut]
+                    era = futures[fut]
                     try:
                         group_results.extend(fut.result())
-                        logger.info("版本组 %s 全部完成", ver)
+                        logger.info("redo 组 [%s] 全部完成（容器 %s）", era, era_container[era])
                     except Exception as e:
-                        logger.error("版本组 %s 异常: %s", ver, e, exc_info=True)
+                        logger.error("redo 组 [%s] 异常: %s", era, e, exc_info=True)
 
         # ---- 阶段 5：聚合 ----
         for tr in group_results:
@@ -247,8 +260,11 @@ class Orchestrator:
 
     # ---------- 阶段：执行一个版本组 ----------
 
-    def _run_group(self, version: str, items: list, port: int) -> list[dict]:
-        """执行一个版本组（组内串行 + 重试）。返回任务结果列表。"""
+    def _run_group(self, era: str, container_version: str, items: list, port: int) -> list[dict]:
+        """执行一个 redo 兼容组（组内串行 + 兼容校验 + 重试）。
+
+        组内容器版本 = 组内备份最高版本（升级安全，绝不降级）。
+        """
         runner = (
             self.runner_factory(port)
             if self.runner_factory
@@ -271,11 +287,24 @@ class Orchestrator:
             task.attempt = attempt_start
 
             inst = plan.instance
-            logger.info(">>> [%s] 开始演练 (v%s, 端口%d, 第%d次)",
-                        inst.name, version, port, task.attempt)
+
+            # 兼容安全校验（Sprint 6：跨代/降级直接判失败，不执行）
+            ok, reason = check_restore_safe(plan.version, container_version)
+            if not ok:
+                task.status = TaskStatus.FAILED_FINAL
+                task.error_msg = f"兼容性拦截: {reason}"
+                task.finished_at = _now_iso()
+                logger.error(">>> [%s] ❌ 兼容性拦截: %s", inst.name, reason)
+                if task.id:
+                    queue.persist_task(task)
+                results.append(self._task_to_dict(task, inst, plan.version))
+                continue
+
+            logger.info(">>> [%s] 开始演练 (备份v%s → 容器v%s, 端口%d, 第%d次)",
+                        inst.name, plan.version, container_version, port, task.attempt)
             task.status = TaskStatus.RUNNING
             task_result = runner.execute(
-                mysql_version=version,
+                mysql_version=container_version,  # 容器/镜像/datadir/xb 按容器版本
                 backup_remote_path=plan.local_backup_path,
                 instance_name=inst.name,
                 backup_source_host=inst.backup_source_host,
@@ -311,7 +340,7 @@ class Orchestrator:
             if task.id:
                 queue.persist_task(task)
             # 只有终态（SUCCESS / FAILED_FINAL）计入结果
-            results.append(self._task_to_dict(task, inst, version))
+            results.append(self._task_to_dict(task, inst, plan.version))
 
         return results
 
@@ -321,6 +350,66 @@ class Orchestrator:
         """基础端口（从 task_runner 的 installer 默认端口取）。"""
         installer = getattr(self.task_runner, "installer", None)
         return getattr(installer, "drill_port", 13306)
+
+    def _existing_era_ports(self) -> dict[str, int]:
+        """已存在的 era→端口 占用（防历史容器端口冲突，Sprint 6 修正版）。
+
+        只统计 **running 容器的真实端口占用**（stopped 容器没监听不占端口，
+        其表内登记可能是历史脏数据——例如曾在单组模式下拿到过基础端口）。
+        端口号查 mysql_containers 表；查不到则用基础端口。
+        """
+        from toolkit.core.models import MysqlContainer
+
+        installer = getattr(self.task_runner, "installer", None)
+        if installer is None:
+            return {}
+
+        # 1. 表登记：版本→端口（仅用于给 running 容器查端口号）
+        version_port: dict[str, int] = {}
+        session = get_session_ctx()
+        try:
+            for rec in session.query(MysqlContainer).all():
+                version_port[rec.mysql_version] = rec.drill_port or self._base_port()
+        finally:
+            session.close()
+
+        # 2. running 容器：真实占用（端口从 docker inspect 实测，不信表——
+        #    容器固化端口可能与登记脱节，Sprint 6 教训）
+        existing: dict[str, int] = {}
+        try:
+            for c in installer.list_containers():
+                if c.status != "running":
+                    continue
+                # 容器名解析版本（drill-mysql-8035 → 8.0.35）
+                digits = c.name.replace(installer.container_prefix, "").replace("-", "")
+                if len(digits) < 3:
+                    continue
+                ver = f"{digits[0]}.{digits[1]}.{digits[2:]}"
+                era = redo_era(ver)
+                # 实测端口：docker inspect 解析 Args 里的 --port=
+                port = self._inspect_container_port(c.name) or self._base_port()
+                existing[era] = port
+        except Exception as e:
+            logger.warning("查询 running 容器端口失败（忽略）: %s", e)
+
+        logger.info("running 容器端口占用: %s", existing or "无")
+        return existing
+
+    def _inspect_container_port(self, container_name: str) -> int | None:
+        """docker inspect 解析容器启动参数里的 --port=（实测固化端口）。"""
+        try:
+            installer = getattr(self.task_runner, "installer", None)
+            res = installer.executor.run(
+                f"docker inspect --format '{{{{.Args}}}}' {container_name} 2>/dev/null"
+            )
+            if res.ok:
+                import re
+                m = re.search(r"--port[=\s]+(\d+)", res.stdout)
+                if m:
+                    return int(m.group(1))
+        except Exception:
+            pass
+        return None
 
     def _create_run(self, target_host: str, total: int) -> int:
         session = get_session_ctx()

@@ -47,12 +47,18 @@ class Verifier:
         password_env: str = "DRILL_MYSQL_PWD",
         exclude_system_dbs: frozenset = DEFAULT_SYSTEM_DBS,
         connect_timeout: int = 30,
+        expected_version: str = "",  # 期望的 MySQL 版本（防连错实例铁闸，Sprint 6）
     ):
         self.host = host
         self.port = port
         self.password_env = password_env
         self.exclude_system_dbs = exclude_system_dbs
         self.connect_timeout = connect_timeout
+        self.expected_version = expected_version
+
+    def set_expected_version(self, version: str) -> None:
+        """设置期望版本（编排器在执行时按容器版本注入）。"""
+        self.expected_version = version
 
     def _get_connection(self) -> pymysql.Connection:
         """连接恢复出的 MySQL（密码从环境变量读，ADR-10）。
@@ -106,6 +112,25 @@ class Verifier:
     def _do_verify(self, conn: pymysql.Connection) -> VerifyResult:
         """执行自动发现验证的核心逻辑。"""
         with conn.cursor() as cur:
+            # 步骤 0：版本铁闸（Sprint 6）——确认连的是期望的恢复实例，
+            # 防止端口被历史容器占用导致的假成功
+            if self.expected_version:
+                cur.execute("SELECT VERSION()")
+                actual = str(cur.fetchone()[0])
+                # "5.7.44-log" 之类带后缀的取前缀比较
+                actual_clean = actual.split("-")[0]
+                expected_clean = self.expected_version.split("-")[0]
+                if not actual_clean.startswith(expected_clean):
+                    return VerifyResult(
+                        passed=False,
+                        detail=(
+                            f"连错实例（版本不匹配）：期望 {self.expected_version}，"
+                            f"实际 {actual}（端口 {self.port} 可能被其他容器占用）"
+                        ),
+                        evidence=f"SELECT VERSION() = {actual} @ {self.host}:{self.port}",
+                    )
+                logger.info("版本铁闸通过: %s（期望 %s）", actual, self.expected_version)
+
             # 步骤 1：查所有库
             cur.execute("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA")
             all_dbs = {row[0] for row in cur.fetchall()}
