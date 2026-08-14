@@ -37,18 +37,25 @@ class Xtrabackup:
         Raises:
             RecoveryError: prepare 失败
         """
-        log_redirect = f" 2>&1 | tee {log_file}" if log_file else ""
+        # 注意：用 2>&1 重定向而非 tee 管道（tee 会覆盖 exit code）
+        if log_file:
+            log_redirect = f" >{log_file} 2>&1"
+        else:
+            log_redirect = " 2>&1"
         cmd = f"{self.binary} --prepare --target-dir={backup_path}{log_redirect}"
         logger.info("xtrabackup prepare: %s", backup_path)
         res = self.executor.run(cmd, timeout=3600)
-        if not res.ok:
-            raise RecoveryError(
-                f"xtrabackup prepare 失败 (rc={res.returncode}): {res.stdout[-500:]}"
-            )
-        # 校验日志含 completed OK!
-        log_content = res.stdout
+        # 即使有重定向，stdout 仍可能捕获输出（取决于 executor 实现）
+        log_content = res.stdout or ""
+        # 如果 stdout 空（被重定向了），尝试读日志文件
+        if not log_content and log_file:
+            read_res = self.executor.run(f"cat {log_file} 2>/dev/null")
+            log_content = read_res.stdout
         if "completed OK!" not in log_content:
-            raise RecoveryError("xtrabackup prepare 未输出 'completed OK!'，可能未成功")
+            raise RecoveryError(
+                f"xtrabackup prepare 未输出 'completed OK!'，可能未成功。"
+                f"日志末尾: {log_content[-500:]}"
+            )
         return log_content
 
     def copy_back(self, backup_path: str, datadir: str, log_file: str | None = None) -> str:
@@ -59,7 +66,10 @@ class Xtrabackup:
         Raises:
             RecoveryError: copy-back 失败
         """
-        log_redirect = f" 2>&1 | tee {log_file}" if log_file else ""
+        if log_file:
+            log_redirect = f" >{log_file} 2>&1"
+        else:
+            log_redirect = " 2>&1"
         cmd = (
             f"{self.binary} --copy-back "
             f"--target-dir={backup_path} "
@@ -67,11 +77,15 @@ class Xtrabackup:
         )
         logger.info("xtrabackup copy-back -> %s", datadir)
         res = self.executor.run(cmd, timeout=3600)
-        if not res.ok:
+        log_content = res.stdout or ""
+        if not log_content and log_file:
+            read_res = self.executor.run(f"cat {log_file} 2>/dev/null")
+            log_content = read_res.stdout
+        if "completed OK!" not in log_content:
             raise RecoveryError(
-                f"xtrabackup copy-back 失败 (rc={res.returncode}): {res.stdout[-500:]}"
+                f"xtrabackup copy-back 未输出 'completed OK!'。日志末尾: {log_content[-500:]}"
             )
-        return res.stdout
+        return log_content
 
     def version(self) -> str:
         """获取 xtrabackup 版本。"""

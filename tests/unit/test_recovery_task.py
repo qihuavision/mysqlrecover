@@ -74,9 +74,11 @@ class TestRecoveryTaskSuccess:
         assert result.success is True
         assert result.container_name == "drill-mysql-8035"
         assert result.verify_count == 42
-        # 验证调用顺序：ensure → start → stop → clean → prepare → copyback → chown → start → verify
+        # 验证调用顺序：ensure → start(wait_ready=False) → stop → clean → prepare → copyback → chown → start(wait_ready=True) → verify
         installer.ensure_container.assert_called_once_with("8.0.35")
-        installer.start.assert_called_with("8.0.35")
+        # start 被调用两次：第一次 wait_ready=False（步骤3-4），第二次 wait_ready=True（步骤9）
+        assert installer.start.call_count == 2
+        installer.start.assert_called_with("8.0.35", wait_ready=True)
         installer.clean_datadir.assert_called_once_with("8.0.35")
         installer.chown_datadir.assert_called_once_with("8.0.35")
         xtrabackup.prepare.assert_called_once()

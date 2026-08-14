@@ -60,7 +60,7 @@ class TestXtrabackup:
     def test_prepare_success(self):
         fake = FakeExecutor()
         fake.run_results[
-            "/usr/bin/xtrabackup --prepare --target-dir=/tmp/bak"
+            "/usr/bin/xtrabackup --prepare --target-dir=/tmp/bak 2>&1"
         ] = ExecResult(0, "... completed OK!\n...", "")
         xb = Xtrabackup(fake)
         log = xb.prepare("/tmp/bak")
@@ -69,8 +69,8 @@ class TestXtrabackup:
     def test_prepare_failure_raises(self):
         fake = FakeExecutor()
         fake.run_results[
-            "/usr/bin/xtrabackup --prepare --target-dir=/tmp/bak"
-        ] = ExecResult(1, "error", "failed")
+            "/usr/bin/xtrabackup --prepare --target-dir=/tmp/bak 2>&1"
+        ] = ExecResult(0, "error failed", "")  # 无 completed OK
         xb = Xtrabackup(fake)
         with pytest.raises(RecoveryError):
             xb.prepare("/tmp/bak")
@@ -78,7 +78,7 @@ class TestXtrabackup:
     def test_prepare_no_completed_ok_raises(self):
         fake = FakeExecutor()
         fake.run_results[
-            "/usr/bin/xtrabackup --prepare --target-dir=/tmp/bak"
+            "/usr/bin/xtrabackup --prepare --target-dir=/tmp/bak 2>&1"
         ] = ExecResult(0, "some output without ok", "")
         xb = Xtrabackup(fake)
         with pytest.raises(RecoveryError, match="completed OK"):
@@ -86,15 +86,15 @@ class TestXtrabackup:
 
     def test_copy_back_success(self):
         fake = FakeExecutor()
-        cmd = "/usr/bin/xtrabackup --copy-back --target-dir=/tmp/bak --datadir=/data/drill/8.0.35/datadir"
+        cmd = "/usr/bin/xtrabackup --copy-back --target-dir=/tmp/bak --datadir=/data/drill/8.0.35/datadir 2>&1"
         fake.run_results[cmd] = ExecResult(0, "completed OK!\n", "")
         xb = Xtrabackup(fake)
         xb.copy_back("/tmp/bak", "/data/drill/8.0.35/datadir")
 
     def test_copy_back_failure_raises(self):
         fake = FakeExecutor()
-        cmd = "/usr/bin/xtrabackup --copy-back --target-dir=/tmp/bak --datadir=/data/drill/8.0.35/datadir"
-        fake.run_results[cmd] = ExecResult(1, "", "datadir not empty")
+        cmd = "/usr/bin/xtrabackup --copy-back --target-dir=/tmp/bak --datadir=/data/drill/8.0.35/datadir 2>&1"
+        fake.run_results[cmd] = ExecResult(0, "datadir not empty", "")  # 无 completed OK
         xb = Xtrabackup(fake)
         with pytest.raises(RecoveryError):
             xb.copy_back("/tmp/bak", "/data/drill/8.0.35/datadir")

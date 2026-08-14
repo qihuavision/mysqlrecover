@@ -106,12 +106,17 @@ class DockerInstaller:
         logger.info("创建容器 %s（镜像 %s）", name, image)
         # 1. 创建 datadir 目录
         self.executor.run_checked(f"mkdir -p {datadir}")
-        # 2. docker run（创建但不启动 MySQL 服务，用 --restart=no 避免开机自启）
+        # 2. docker run（联调验证过的参数，见交接文档联调细节）
+        #    --skip-log-bin: 避免 xtrabackup 拷 binlog 失败
+        #    --default-authentication-plugin=mysql_native_password: 避免 caching_sha2 认证问题
+        #    --mysqlx=0: 关闭 X 协议（不需要）
         cmd = (
             f"docker run -d --network host --name {name} "
             f"-v {datadir}:/var/lib/mysql "
             f"--restart=no "
-            f"{image} --port={self.drill_port} --mysqlx=0"
+            f"{image} --port={self.drill_port} --mysqlx=0 "
+            f"--skip-log-bin "
+            f"--default-authentication-plugin=mysql_native_password"
         )
         try:
             self.executor.run_checked(cmd)
@@ -128,14 +133,43 @@ class DockerInstaller:
 
     # ---------- 容器启停 ----------
 
-    def start(self, version: str) -> None:
-        """启动某版本容器。"""
+    def start(self, version: str, wait_ready: bool = True) -> None:
+        """启动某版本容器。
+
+        Args:
+            wait_ready: 是否等待 MySQL TCP 端口就绪（联调发现需 35-40 秒）。
+                        恢复流程中 copy-back 前的 start 不需要等待（马上要 stop）。
+        """
         name = self.container_name(version)
         logger.info("启动容器 %s", name)
         res = self.executor.run(f"docker start {name}")
         if not res.ok:
             raise InstallError(f"启动容器 {name} 失败: {res.stderr}")
         self._update_status(version, "running")
+        if wait_ready:
+            self.wait_ready(version)
+
+    def wait_ready(self, version: str, timeout: int = 60) -> bool:
+        """等待 MySQL TCP 端口就绪（联调细节：ping 假就绪，TCP 监听更晚）。
+
+        用 docker exec 在容器内跑 mysqladmin ping（TCP 方式）。
+        """
+        name = self.container_name(version)
+        import time
+
+        logger.info("等待 %s MySQL 就绪（最多 %d 秒）...", name, timeout)
+        for i in range(timeout // 3):
+            # 用 TCP 方式 ping（比 socket 更可靠反映真实就绪状态）
+            res = self.executor.run(
+                f"docker exec {name} mysqladmin ping -h127.0.0.1 -P{self.drill_port} "
+                f"--silent 2>/dev/null"
+            )
+            if res.ok:
+                logger.info("MySQL %s 已就绪（等待了 %d 秒）", version, i * 3)
+                return True
+            time.sleep(3)
+        logger.warning("MySQL %s 在 %d 秒内未就绪", version, timeout)
+        return False
 
     def stop(self, version: str) -> None:
         """停止某版本容器。"""

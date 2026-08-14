@@ -127,8 +127,9 @@ class RecoveryTaskRunner:
                     self.installer.stop_by_name(c.name)
 
             # 步骤 3 & 4：启动后立即停止（确保容器可用 + copy-back 前置停止）
+            # 注意：这里不 wait_ready（马上要 stop），只是让容器初始化 datadir 结构
             logger.info("[%s] 步骤3-4: 启动并停止容器 %s", instance_name, container)
-            self.installer.start(mysql_version)
+            self.installer.start(mysql_version, wait_ready=False)
             self.installer.stop(mysql_version)
 
             # 步骤 5：清空 datadir
@@ -152,9 +153,9 @@ class RecoveryTaskRunner:
             logger.info("[%s] 步骤8: chown datadir", instance_name)
             self.installer.chown_datadir(mysql_version)
 
-            # 步骤 9：启动容器
-            logger.info("[%s] 步骤9: 启动容器", instance_name)
-            self.installer.start(mysql_version)
+            # 步骤 9：启动容器（等待 MySQL 就绪，联调发现需 35-40 秒）
+            logger.info("[%s] 步骤9: 启动容器（等待就绪）", instance_name)
+            self.installer.start(mysql_version, wait_ready=True)
 
             # 步骤 10：验证（ADR-10 自动发现）
             logger.info("[%s] 步骤10: 验证", instance_name)
