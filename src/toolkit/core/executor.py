@@ -123,7 +123,7 @@ class SSHExecutor(CommandExecutor):
         self._client = None  # paramiko.SSHClient，惰性连接
 
     def _get_client(self):
-        """惰性建立 SSH 连接（复用同一连接）。"""
+        """惰性建立 SSH 连接（复用同一连接）。带重试（Sprint 4 稳定性）。"""
         if self._client is not None:
             return self._client
         import paramiko  # 延迟导入，未装 paramiko 时本地操作不受影响
@@ -143,19 +143,54 @@ class SSHExecutor(CommandExecutor):
         else:
             # 无密钥无密码，尝试默认 agent
             pass
-        logger.debug("SSH connect %s@%s:%s", self.user, self.host, self.port)
-        client.connect(**connect_kwargs)
-        self._client = client
-        return client
+
+        # 连接重试（3 次，退避 1s/2s/4s）——长时间演练网络抖动容错
+        import time
+        last_err = None
+        for attempt in range(1, 4):
+            try:
+                logger.debug("SSH connect %s@%s:%s (attempt %d)", self.user, self.host, self.port, attempt)
+                client.connect(**connect_kwargs)
+                self._client = client
+                return client
+            except Exception as e:
+                last_err = e
+                logger.warning("SSH 连接失败（第 %d 次）: %s", attempt, e)
+                if attempt < 3:
+                    time.sleep(2 ** (attempt - 1))
+        raise RuntimeError(f"SSH 连接 {self.user}@{self.host}:{self.port} 失败（重试3次）: {last_err}")
+
+    def _reset_client(self) -> None:
+        """重置连接（断线后重建）。"""
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+        self._client = None
 
     def run(self, cmd: str, timeout: int | None = None) -> ExecResult:
+        """执行远程命令。连接断开时自动重连一次（Sprint 4 稳定性）。"""
         logger.debug("ssh run [%s]: %s", self.host, cmd)
-        client = self._get_client()
-        stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
-        exit_code = stdout.channel.recv_exit_status()
-        out = stdout.read().decode("utf-8", errors="replace")
-        err = stderr.read().decode("utf-8", errors="replace")
-        return ExecResult(returncode=exit_code, stdout=out, stderr=err)
+        try:
+            client = self._get_client()
+            stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
+            exit_code = stdout.channel.recv_exit_status()
+            out = stdout.read().decode("utf-8", errors="replace")
+            err = stderr.read().decode("utf-8", errors="replace")
+            return ExecResult(returncode=exit_code, stdout=out, stderr=err)
+        except RuntimeError:
+            raise  # 连接失败（已重试3次）直接抛
+        except Exception as e:
+            # 传输层异常（连接断开等）：重置连接重试一次
+            logger.warning("SSH 执行异常（%s），重置连接重试: %s", type(e).__name__, e)
+            self._reset_client()
+            client = self._get_client()
+            stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
+            exit_code = stdout.channel.recv_exit_status()
+            out = stdout.read().decode("utf-8", errors="replace")
+            err = stderr.read().decode("utf-8", errors="replace")
+            return ExecResult(returncode=exit_code, stdout=out, stderr=err)
 
     def put(self, local: str, remote: str) -> None:
         """通过 SFTP 上传文件。"""

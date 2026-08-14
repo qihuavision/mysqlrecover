@@ -397,6 +397,54 @@ def drill_status(config_path):
         session.close()
 
 
+# ==================== cleanup 清理（Sprint 4）====================
+
+
+@main.command("cleanup")
+@CONFIG_PATH_OPTION
+@click.option("--target", help="恢复机 IP（清理远程临时备份需要）")
+@click.option("--tasks-days", default=180, show_default=True, help="任务/日志保留天数")
+@click.option("--reports-days", default=90, show_default=True, help="报告文件保留天数")
+@click.option("--backups-days", default=7, show_default=True, help="远程临时备份保留天数")
+@click.option("--yes", is_flag=True, help="真正执行（默认 dry-run）")
+def cleanup(config_path, target, tasks_days, reports_days, backups_days, yes):
+    """清理超期数据：旧任务记录 + 旧报告 + 远程临时备份。"""
+    cfg = _bootstrap(config_path)
+    from toolkit.core import retention
+
+    if not yes:
+        click.echo(f"[dry-run] 将清理：")
+        click.echo(f"  - 超过 {tasks_days} 天的任务/日志记录（数据库）")
+        click.echo(f"  - 超过 {reports_days} 天的报告文件（{cfg.report.output_dir}）")
+        if target:
+            click.echo(f"  - 超过 {backups_days} 天的临时备份（恢复机 {target}）")
+        click.echo("加 --yes 真正执行")
+        return
+
+    total = 0
+    # 1. 数据库旧任务
+    n1 = retention.cleanup_old_tasks(keep_days=tasks_days)
+    click.echo(f"✅ 清理数据库旧任务: {n1} 条")
+
+    # 2. 本地旧报告
+    n2 = retention.cleanup_local_reports(cfg.report.output_dir, keep_days=reports_days)
+    click.echo(f"✅ 清理旧报告文件: {n2} 个")
+
+    # 3. 远程临时备份
+    if target:
+        from toolkit.core.executor import SSHExecutor
+        executor = SSHExecutor(host=target, user=cfg.target.ssh_user,
+                               port=cfg.target.ssh_port, key_path=cfg.target.ssh_key_path)
+        n3 = retention.cleanup_remote_backups(
+            executor, cfg.target.tmp_backup_dir, keep_days=backups_days
+        )
+        click.echo(f"✅ 清理远程临时备份: {n3} 个目录")
+        total += n3
+
+    total += n1 + n2
+    click.echo(f"\n===== 清理完成，共 {total} 项 =====")
+
+
 # ==================== config 配置管理 ====================
 
 
