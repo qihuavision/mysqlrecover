@@ -184,53 +184,78 @@ def backup_list(config_path):
 @backup.command("trigger")
 @CONFIG_PATH_OPTION
 @INSTANCES_PATH_OPTION
-@click.option("--instance", required=True, help="要备份的实例名")
+@click.option("--instance", help="要备份的单个实例名（与 --all 二选一）")
+@click.option("--all", "all_instances", is_flag=True, help="备份所有 enabled 实例（批量）")
 @click.option("--backup-root", default="/data/backups", help="备份落盘根目录（源机本地）")
 @click.option("--yes", is_flag=True, help="跳过 dry-run，真正执行")
-def backup_trigger(config_path, instances_path, instance, backup_root, yes):
-    """触发一次 xtrabackup 备份（FP-02, ADR-06 接管模式）。
+def backup_trigger(config_path, instances_path, instance, all_instances, backup_root, yes):
+    """触发 xtrabackup 备份（FP-02, ADR-06 接管模式，支持批量）。
 
-    SSH 到实例所在机器执行 xtrabackup --backup，产物登记入库。
-    用于替代原 crontab 备份任务。
+    SSH 到实例所在机器执行 xtrabackup --backup，产物自动登记入库。
+    配 crontab 定时跑即可完全替代旧备份脚本（见使用手册 5.7）。
     """
     cfg = _bootstrap(config_path)
     instances = load_instances(instances_path)
-    target = [i for i in instances if i.name == instance]
-    if not target:
-        click.echo(f"❌ 实例 {instance} 不在清单中")
+
+    if instance:
+        targets = [i for i in instances if i.name == instance]
+        if not targets:
+            click.echo(f"❌ 实例 {instance} 不在清单中")
+            sys.exit(1)
+    elif all_instances:
+        targets = [i for i in instances if i.enabled]
+        if not targets:
+            click.echo("❌ 无 enabled 实例")
+            sys.exit(1)
+    else:
+        click.echo("请指定 --instance <name> 或 --all（批量备份所有实例）")
         sys.exit(1)
-    inst_cfg = target[0]
 
     from toolkit.core.executor import SSHExecutor
     from toolkit.backup.runner import BackupRunner
-    from toolkit.core.models import Instance as InstanceModel
 
     # 实例入库拿 ORM 对象
-    db_instances = _sync_instances_to_db([inst_cfg])
-    db_inst = db_instances[0]
+    db_instances = _sync_instances_to_db(targets)
+    db_map = {d.name: d for d in db_instances}
 
     if not yes:
-        click.echo(f"[dry-run] 将备份 {inst_cfg.name}（{inst_cfg.host}）-> {backup_root}/{inst_cfg.name}/")
+        click.echo(f"[dry-run] 将备份 {len(targets)} 个实例 -> {backup_root}/:")
+        for i in targets:
+            click.echo(f"  - {i.name}（{i.host}:{i.port}）")
         click.echo("加 --yes 真正执行")
         return
 
-    # SSH 到实例所在机器
     ssh_key = cfg.target.ssh_key_path
-    executor = SSHExecutor(host=inst_cfg.host, user=cfg.target.ssh_user,
-                           port=cfg.target.ssh_port, key_path=ssh_key)
-    runner = BackupRunner(
-        executor=executor,
-        xtrabackup_path=cfg.xtrabackup.binary_path,
-        mysql_port=inst_cfg.port,
-        # 容器化 MySQL：datadir 指宿主机挂载路径（物理机 MySQL 留空自动探测）
-        datadir=f"{cfg.docker.datadir_base}/{inst_cfg.mysql_version}/datadir"
-                if inst_cfg.port == cfg.docker.drill_port else "",
-    )
-    try:
-        backup_id = runner.run_backup(db_inst, backup_root)
-        click.echo(f"✅ 备份完成并登记：backup #{backup_id}")
-    except Exception as e:
-        click.echo(f"❌ 备份失败: {e}")
+    ok_count, fail_count, fail_list = 0, 0, []
+
+    for inst_cfg in targets:
+        db_inst = db_map[inst_cfg.name]
+        click.echo(f">>> 备份 {inst_cfg.name}（{inst_cfg.host}:{inst_cfg.port}）...")
+        # 每实例独立连接（实例可能分布在不同机器）
+        executor = SSHExecutor(host=inst_cfg.host, user=cfg.target.ssh_user,
+                               port=cfg.target.ssh_port, key_path=ssh_key)
+        runner = BackupRunner(
+            executor=executor,
+            xtrabackup_path=cfg.xtrabackup.binary_path,
+            mysql_port=inst_cfg.port,
+            # 容器化 MySQL：datadir 指宿主机挂载路径（物理机 MySQL 留空自动探测）
+            datadir=f"{cfg.docker.datadir_base}/{inst_cfg.mysql_version}/datadir"
+                    if inst_cfg.port == cfg.docker.drill_port else "",
+        )
+        try:
+            backup_id = runner.run_backup(db_inst, backup_root)
+            click.echo(f"  ✅ backup #{backup_id}")
+            ok_count += 1
+        except Exception as e:
+            click.echo(f"  ❌ 失败: {e}")
+            fail_count += 1
+            fail_list.append(inst_cfg.name)
+        finally:
+            executor.close()
+
+    click.echo(f"\n===== 批量备份完成: 成功 {ok_count}, 失败 {fail_count} =====")
+    if fail_list:
+        click.echo(f"失败实例: {', '.join(fail_list)}")
         sys.exit(1)
 
 
