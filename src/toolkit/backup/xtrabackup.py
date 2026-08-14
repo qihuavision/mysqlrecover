@@ -18,18 +18,39 @@ logger = get_logger(__name__)
 
 
 class Xtrabackup:
-    """xtrabackup 命令封装（经 executor 在恢复机执行）。"""
+    """xtrabackup 命令封装（经 executor 在恢复机执行）。
 
-    def __init__(self, executor: CommandExecutor, binary_path: str = "/usr/bin/xtrabackup"):
+    支持版本矩阵（Sprint 5）：不同 MySQL 版本用不同的 xtrabackup 二进制。
+    binary_matrix 形如 {"8.0": "/usr/bin/xtrabackup", "5.7": "/usr/bin/xtrabackup24"}，
+    未匹配的版本回退 binary_path。
+    """
+
+    def __init__(
+        self,
+        executor: CommandExecutor,
+        binary_path: str = "/usr/bin/xtrabackup",
+        binary_matrix: dict[str, str] | None = None,
+    ):
         self.executor = executor
         self.binary = binary_path
+        self.binary_matrix = binary_matrix or {}
 
-    def prepare(self, backup_path: str, log_file: str | None = None) -> str:
+    def binary_for(self, mysql_version: str) -> str:
+        """按 MySQL 版本选择 xtrabackup 二进制（版本矩阵）。
+
+        匹配规则：取 major.minor（如 8.0.35 → 8.0）在矩阵中查；
+        未配置则回退默认 binary。
+        """
+        major_minor = ".".join(mysql_version.split(".")[:2])
+        return self.binary_matrix.get(major_minor, self.binary)
+
+    def prepare(self, backup_path: str, log_file: str | None = None, mysql_version: str = "") -> str:
         """xtrabackup --prepare --target-dir=<backup_path>
 
         Args:
             backup_path: 备份目录（恢复机本地路径）
             log_file: 日志输出路径（供验证 grep completed OK!）
+            mysql_version: MySQL 版本（选版本矩阵对应的 xtrabackup 二进制）
 
         Returns:
             日志内容（或写入 log_file）
@@ -42,8 +63,9 @@ class Xtrabackup:
             log_redirect = f" >{log_file} 2>&1"
         else:
             log_redirect = " 2>&1"
-        cmd = f"{self.binary} --prepare --target-dir={backup_path}{log_redirect}"
-        logger.info("xtrabackup prepare: %s", backup_path)
+        binary = self.binary_for(mysql_version)
+        cmd = f"{binary} --prepare --target-dir={backup_path}{log_redirect}"
+        logger.info("xtrabackup prepare（%s）: %s", mysql_version, backup_path)
         res = self.executor.run(cmd, timeout=3600)
         # 即使有重定向，stdout 仍可能捕获输出（取决于 executor 实现）
         log_content = res.stdout or ""
@@ -58,7 +80,7 @@ class Xtrabackup:
             )
         return log_content
 
-    def copy_back(self, backup_path: str, datadir: str, log_file: str | None = None) -> str:
+    def copy_back(self, backup_path: str, datadir: str, log_file: str | None = None, mysql_version: str = "") -> str:
         """xtrabackup --copy-back --target-dir=<backup> --datadir=<datadir>
 
         前置条件：MySQL 已停止、datadir 已清空。
@@ -70,8 +92,9 @@ class Xtrabackup:
             log_redirect = f" >{log_file} 2>&1"
         else:
             log_redirect = " 2>&1"
+        binary = self.binary_for(mysql_version)
         cmd = (
-            f"{self.binary} --copy-back "
+            f"{binary} --copy-back "
             f"--target-dir={backup_path} "
             f"--datadir={datadir}{log_redirect}"
         )

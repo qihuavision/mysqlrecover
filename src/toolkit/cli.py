@@ -253,32 +253,52 @@ def drill() -> None:
 @click.option("--resume", "resume_run_id", type=int, default=None,
               help="断点续跑：从指定批次 ID 继续（配合 --yes）")
 def drill_run(config_path, instances_path, target, all_instances, instance, yes, resume_run_id):
-    """执行恢复演练（多实例编排 + 失败重试 + 断点续跑）。默认 dry-run。"""
+    """执行恢复演练（多版本并行 + 版本自动检测 + 重试 + 断点续跑）。默认 dry-run。"""
     cfg = _bootstrap(config_path)
 
     # 构建组件
     from toolkit.core.executor import SSHExecutor
     from toolkit.installer.docker import DockerInstaller
     from toolkit.backup.xtrabackup import Xtrabackup
+    from toolkit.backup.locator import BackupLocator
+    from toolkit.backup.puller import BackupPuller
     from toolkit.recovery.verifier import Verifier
     from toolkit.recovery.task import RecoveryTaskRunner
     from toolkit.recovery.orchestrator import Orchestrator
 
     ssh_key = cfg.target.ssh_key_path
-    executor = SSHExecutor(host=target, user=cfg.target.ssh_user,
+
+    def _make_recovery_executor():
+        """每个版本线程独立的恢复机 SSH 连接（线程安全）。"""
+        return SSHExecutor(host=target, user=cfg.target.ssh_user,
                            port=cfg.target.ssh_port, key_path=ssh_key)
-    installer = DockerInstaller(
-        executor=executor, drill_port=cfg.docker.drill_port,
-        datadir_base=cfg.docker.datadir_base,
-        supported_versions=cfg.docker.supported_versions,
-    )
-    xb = Xtrabackup(executor=executor, binary_path=cfg.xtrabackup.binary_path)
-    verifier = Verifier(host=target, port=cfg.docker.drill_port)
-    runner = RecoveryTaskRunner(
-        executor=executor, installer=installer, xtrabackup=xb,
-        verifier=verifier, archive_root=cfg.archive.root,
-        tmp_backup_dir=cfg.target.tmp_backup_dir,
-    )
+
+    def _make_source_executor():
+        """备份源机 SSH 连接（版本检测用）。"""
+        return SSHExecutor(host=cfg.backup.source_host, user=cfg.backup.source_ssh_user,
+                           key_path=cfg.backup.source_ssh_key_path)
+
+    def make_runner(port: int) -> RecoveryTaskRunner:
+        """runner 工厂：按端口创建独立一套组件（多版本并行，Sprint 5）。"""
+        ex = _make_recovery_executor()
+        installer = DockerInstaller(
+            executor=ex, drill_port=cfg.docker.drill_port,
+            datadir_base=cfg.docker.datadir_base,
+            supported_versions=cfg.docker.supported_versions,
+        )
+        xb = Xtrabackup(
+            executor=ex, binary_path=cfg.xtrabackup.binary_path,
+            binary_matrix=cfg.xtrabackup.binary_matrix,
+        )
+        verifier = Verifier(host=target, port=port)
+        return RecoveryTaskRunner(
+            executor=ex, installer=installer, xtrabackup=xb,
+            verifier=verifier, archive_root=cfg.archive.root,
+            tmp_backup_dir=cfg.target.tmp_backup_dir,
+        )
+
+    # 主线程 runner（单版本/串行模式用）
+    runner = make_runner(cfg.docker.drill_port)
 
     # Sprint 3：报告 + 通知
     from toolkit.reporters.markdown import MarkdownReporter
@@ -292,9 +312,19 @@ def drill_run(config_path, instances_path, target, all_instances, instance, yes,
         )
 
     orch = Orchestrator(
-        task_runner=runner, max_retry=cfg.drill.max_retry,
+        task_runner=runner,
+        runner_factory=make_runner,                       # Sprint 5 多版本并行
+        locator_factory=lambda: BackupLocator(_make_source_executor()),  # 版本检测
+        puller_factory=lambda: BackupPuller(              # 备份拉取
+            executor=_make_recovery_executor(),
+            tmp_backup_dir=cfg.target.tmp_backup_dir,
+            source_ssh_user=cfg.backup.source_ssh_user,
+        ),
+        max_retry=cfg.drill.max_retry,
+        parallel=cfg.drill.parallel,                      # Sprint 5 并行开关
         reporter=reporter, notifier=notifier,
         archive_root=cfg.archive.root,
+        recovery_host=target,
     )
 
     # 断点续跑模式
