@@ -197,36 +197,19 @@ def drill() -> None:
 @click.option("--all", "all_instances", is_flag=True, help="演练所有 enabled 实例")
 @click.option("--instance", help="指定单个实例名")
 @click.option("--yes", is_flag=True, help="跳过 dry-run，真正执行")
-def drill_run(config_path, instances_path, target, all_instances, instance, yes):
-    """执行恢复演练。默认 dry-run，--yes 才真正执行。"""
+@click.option("--resume", "resume_run_id", type=int, default=None,
+              help="断点续跑：从指定批次 ID 继续（配合 --yes）")
+def drill_run(config_path, instances_path, target, all_instances, instance, yes, resume_run_id):
+    """执行恢复演练（多实例编排 + 失败重试 + 断点续跑）。默认 dry-run。"""
     cfg = _bootstrap(config_path)
-    instances = load_instances(instances_path)
-    if instance:
-        instances = [i for i in instances if i.name == instance]
-    elif all_instances:
-        instances = [i for i in instances if i.enabled]
-    else:
-        click.echo("请指定 --all 或 --instance <name>")
-        sys.exit(1)
 
-    from toolkit.installer.version_manager import VersionManager
-    # 按版本升序排队（ADR-09：同版本连续）
-    instances.sort(key=lambda i: VersionManager.sort_versions_asc([i.mysql_version])[0])
-
-    click.echo(f"待演练实例: {len(instances)} 个 (dry_run={not yes})")
-    for inst in instances:
-        click.echo(f"  - {inst.name} ({inst.mysql_version})")
-
-    if not yes:
-        click.echo("\n[dry-run] 未实际执行。加 --yes 真正执行。")
-        return
-
-    # 真正执行（Sprint 1 跑通单实例，Sprint 2 完善编排 + 重试）
+    # 构建组件
     from toolkit.core.executor import SSHExecutor
     from toolkit.installer.docker import DockerInstaller
     from toolkit.backup.xtrabackup import Xtrabackup
     from toolkit.recovery.verifier import Verifier
     from toolkit.recovery.task import RecoveryTaskRunner
+    from toolkit.recovery.orchestrator import Orchestrator
 
     ssh_key = cfg.target.ssh_key_path
     executor = SSHExecutor(host=target, user=cfg.target.ssh_user,
@@ -243,27 +226,88 @@ def drill_run(config_path, instances_path, target, all_instances, instance, yes)
         verifier=verifier, archive_root=cfg.archive.root,
         tmp_backup_dir=cfg.target.tmp_backup_dir,
     )
+    orch = Orchestrator(task_runner=runner, max_retry=cfg.drill.max_retry)
 
-    success_count = 0
-    failed_count = 0
-    for inst in instances:
-        click.echo(f"\n>>> 演练 {inst.name} ({inst.mysql_version})...")
-        # Sprint 1: 备份路径先用实例配置的 source_path（Sprint 2 加 scp 拉取）
-        result = runner.execute(
-            mysql_version=inst.mysql_version,
-            backup_remote_path=inst.backup_source_path,  # TODO Sprint 2: scp 到恢复机
-            instance_name=inst.name,
-            backup_source_host=inst.backup_source_host,
-            dry_run=False,
-        )
-        status = "✅ 成功" if result.success else "❌ 失败"
-        click.echo(f"  {status} ({result.duration_sec}s) {result.error_msg}")
-        if result.success:
-            success_count += 1
-        else:
-            failed_count += 1
+    # 断点续跑模式
+    if resume_run_id:
+        if not yes:
+            click.echo("断点续跑需要 --yes")
+            sys.exit(1)
+        click.echo(f">>> 断点续跑批次 #{resume_run_id}...")
+        result = orch.run(target_host=target, instances=[], dry_run=False,
+                          resume_run_id=resume_run_id)
+        _print_drill_result(result)
+        return
 
-    click.echo(f"\n===== 演练完成: 成功 {success_count}, 失败 {failed_count} =====")
+    # 正常模式：筛选实例
+    instances = load_instances(instances_path)
+    if instance:
+        instances = [i for i in instances if i.name == instance]
+    elif all_instances:
+        instances = [i for i in instances if i.enabled]
+    else:
+        click.echo("请指定 --all 或 --instance <name>")
+        sys.exit(1)
+
+    # 实例同步入库（编排器需要 ORM Instance）
+    db_instances = _sync_instances_to_db(instances)
+
+    click.echo(f"待演练实例: {len(db_instances)} 个 (dry_run={not yes})")
+
+    result = orch.run(target_host=target, instances=db_instances, dry_run=not yes)
+    _print_drill_result(result)
+
+
+def _sync_instances_to_db(instances_cfg) -> list:
+    """把 YAML 实例配置同步到数据库（存在则更新），返回 ORM Instance 列表。"""
+    from toolkit.core.models import Instance as InstanceModel
+    session = get_session_ctx()
+    try:
+        result = []
+        for cfg_inst in instances_cfg:
+            db_inst = session.query(InstanceModel).filter_by(name=cfg_inst.name).first()
+            if db_inst:
+                # 更新
+                db_inst.host = cfg_inst.host
+                db_inst.port = cfg_inst.port
+                db_inst.mysql_version = cfg_inst.mysql_version
+                db_inst.backup_source_host = cfg_inst.backup_source_host
+                db_inst.backup_source_path = cfg_inst.backup_source_path
+                db_inst.enabled = int(cfg_inst.enabled)
+            else:
+                db_inst = InstanceModel(
+                    name=cfg_inst.name, host=cfg_inst.host, port=cfg_inst.port,
+                    mysql_version=cfg_inst.mysql_version,
+                    backup_source_host=cfg_inst.backup_source_host,
+                    backup_source_path=cfg_inst.backup_source_path,
+                    enabled=int(cfg_inst.enabled),
+                )
+                session.add(db_inst)
+            result.append(db_inst)
+        session.commit()
+        return result
+    finally:
+        session.close()
+
+
+def _print_drill_result(result) -> None:
+    """打印演练结果汇总。"""
+    click.echo(f"\n===== 演练完成 =====")
+    click.echo(f"批次: #{result.run_id}")
+    click.echo(f"总计: {result.total}  成功: {result.success}  失败: {result.failed}  "
+               f"重试: {result.retried}  跳过: {result.skipped}")
+    click.echo(f"耗时: {result.duration_sec}s")
+    if result.task_results:
+        click.echo("\n明细:")
+        for t in result.task_results:
+            status_icon = {"SUCCESS": "✅", "FAILED_FINAL": "❌", "DRY_RUN": "📝"}.get(
+                t.get("status", ""), "⏳"
+            )
+            click.echo(f"  {status_icon} {t.get('instance', '?')} (v{t.get('version', '?')}) "
+                       f"[{t.get('status')}] attempt={t.get('attempt', 1)} "
+                       f"{t.get('duration_sec', 0)}s")
+            if t.get("error"):
+                click.echo(f"     错误: {t['error']}")
 
 
 @drill.command("status")
