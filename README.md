@@ -63,11 +63,11 @@ toolkit cleanup --yes
 
 管理机：
 
-- python 3.10+
+- python 3.10+（注意 CentOS 7 自带的 3.6 跑不了，见下面的老系统方案）
 - ssh 免密到恢复机和备份机
 - 两个环境变量：`DRILL_SSH_KEY`、`DRILL_MYSQL_PWD`
 
-安装：
+安装（**以下命令都在仓库根目录执行**，config/ 在根目录下，不在 src/ 里）：
 
 ```bash
 git clone https://github.com/qihuavision/mysqlrecover.git
@@ -79,6 +79,34 @@ cp config/instances.example.yaml config/instances.yaml
 ```
 
 跑之前先 `toolkit config doctor --target <IP>` 检查一遍环境。
+
+### 老系统（CentOS 7 等）怎么办
+
+CentOS 7 的 yum 里没有 pip 这个包名，自带的 python 3.6 也太老。两个办法：
+
+办法一，用 docker 跑工具，不碰 python：
+
+```bash
+# 装 docker 后，在仓库根目录：
+docker build -t mysqlrecover:latest .
+
+# 之后所有 toolkit 命令换成：
+docker run --rm \
+  -v $PWD/config:/app/config:ro \
+  -v $PWD/data:/app/data \
+  -v $PWD/logs:/app/logs \
+  -v ~/.ssh:/app/ssh:ro \
+  -e DRILL_MYSQL_PWD='密码' \
+  mysqlrecover:latest <命令，如 drill run --target <IP> --all --yes>
+```
+
+办法二，miniconda 装个新 python：
+
+```bash
+curl -o /tmp/miniconda.sh https://mirrors.tuna.tsinghua.edu.cn/anaconda/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash /tmp/miniconda.sh -b -p /opt/miniconda3
+/opt/miniconda3/bin/pip install -e .    # 在仓库根目录
+```
 
 ## 定时
 
