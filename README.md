@@ -1,37 +1,103 @@
 # mysqlrecover
 
-> 基于 MySQL XtraBackup 的**自动备份**与**批量恢复演练**工具。
+mysql 的备份到底能不能恢复，别等出事了才知道。
 
-## 项目简介
+解放双手 —— DBA 只需提供一台空服务器，自动完成装库、自动恢复、自动验证、日志留档。
 
-`mysqlrecover` 围绕 Percona XtraBackup 构建，提供端到端的备份与恢复能力，核心解决两个问题：
+管着上百个 mysql 实例（5.7、8.0 混着），备份虽然天天在做，但要确认备份真出事时恢复得出来，以前只能人肉：每台先装对应版本的 mysql，xtrabackup 恢复进去，再登录查一张表。一百台就循环一百遍，慢、容易漏，做完还留不下证据。
 
-1. **自动备份** —— 按计划对 MySQL 实例进行全量 / 增量备份，无需人工干预。
-2. **批量恢复演练** —— 自动对备份文件进行**恢复验证（restore drill）**，确保备份在真实灾难下可被还原，避免"备份了却恢复不出来"的风险。
+现在一条命令：
 
-## 核心特性
+```bash
+toolkit drill run --target <恢复机IP> --all --yes
+```
 
-- 🔁 **自动化备份**：基于 XtraBackup，支持全量 + 增量备份策略
-- 🧪 **恢复演练**：批量对历史备份执行恢复验证，产出可恢复性报告
-- 📦 **批量处理**：一次性处理多个实例 / 多份备份
-- ⚙️ **可配置**：备份周期、保留策略、演练范围均可通过配置文件调整
+工具自己认版本（配置里填错了也会从备份文件里纠正过来）、按版本分组并行恢复、起库、进库里数数、出报告、发企业微信。
 
-## 技术栈
+## 常用命令
 
-- MySQL / Percona XtraBackup
-- Shell 脚本自动化
+备份（接管原来 crontab 里的备份脚本，支持一次备全部实例）：
 
-## 适用场景
+```bash
+toolkit backup trigger --all --yes
+```
 
-- 生产数据库的日常备份与留存
-- 定期恢复演练（Disaster Recovery Drill）
-- 备份可用性巡检与合规验证
+恢复演练：
 
-## 相关概念
+```bash
+toolkit drill run --target <IP> --all --yes              # 全部
+toolkit drill run --target <IP> --instance order-db --yes # 单个
+toolkit drill run --target <IP> --resume 7 --yes          # 中途断了，从批次 7 续跑
+```
 
-- **XtraBackup**：Percona 提供的开源热备份工具，支持 InnoDB 在线备份
-- **恢复演练（Restore Drill）**：在隔离环境还原来自备份的数据，验证其完整性与可恢复性
+体检和清理：
 
----
+```bash
+toolkit config doctor --target <IP>
+toolkit cleanup --yes
+```
 
-> 📌 本仓库为个人维护项目，欢迎提 Issue 交流。
+## 版本支持
+
+- 5.7 / 8.0 混合环境
+- 按 Percona 官方兼容规则分组：5.7 一组，8.0.30 前后各一组（redo 格式变了）。同组共用一套恢复环境，组内用最高版本恢复，不会降级；不同组并行跑
+- 5.7 要用的 xtrabackup 2.4 和 8.0 的会冲突，直接走容器，宿主机不用装两份
+
+## 验证规则
+
+恢复起来只算一半，工具会登录进去：跳过系统库找业务库，挑有数据的表 count，数出来大于 0 才算过。
+
+每台验证前还会先核对这个库的版本号对不对。这个闸是踩过坑加的——端口被别的容器占着，验证连到了别的库，报告显示成功但数据是错的。现在版本对不上直接判失败，不糊弄。
+
+失败自动重试一次。xtrabackup 日志、验证日志、出错时的 docker 日志和 mysql 错误日志，都按日期归档在恢复机上，审计直接拿目录就行。
+
+## 部署
+
+恢复机（一台空服务器就行）：
+
+- docker
+- xtrabackup 8.0
+- 用到的 mysql 版本镜像（docker pull）
+- 跑一次 `scripts/bootstrap_recovery_host.sh`
+
+管理机：
+
+- python 3.10+
+- ssh 免密到恢复机和备份机
+- 两个环境变量：`DRILL_SSH_KEY`、`DRILL_MYSQL_PWD`
+
+安装：
+
+```bash
+git clone https://github.com/qihuavision/mysqlrecover.git
+cd mysqlrecover
+pip install -e .
+cp config/config.example.yaml config/config.yaml
+cp config/instances.example.yaml config/instances.yaml
+# 改这两个文件
+```
+
+跑之前先 `toolkit config doctor --target <IP>` 检查一遍环境。
+
+## 定时
+
+crontab 加三行，之后不用管了，周一早上看微信：
+
+```cron
+0 2 * * * toolkit backup trigger --all --yes
+0 3 * * 0 toolkit drill run --target <IP> --all --yes
+0 4 * * 0 toolkit cleanup --yes
+```
+
+## 目录
+
+```
+src/toolkit/   代码
+docs/          立项书、PRD、设计、使用手册、交接文档
+scripts/       恢复机初始化、造测试备份的脚本
+tests/         单元测试
+```
+
+写得最全的是 `docs/11-使用手册.md`，每个命令带参数说明和例子。设计上的取舍都记在 `docs/99-交接文档.md`。
+
+不做的事：监控告警（有 Prometheus）、主从切换（有 Orchestrator）、数据同步（有 Canal）。工具全程只读账号，不碰生产库，演练都在隔离的恢复机上做。
