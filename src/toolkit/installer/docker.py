@@ -75,9 +75,18 @@ class DockerInstaller:
     # ---------- 版本校验 ----------
 
     def _check_version(self, version: str) -> None:
-        if self.supported_versions and version not in self.supported_versions:
+        """版本校验（Sprint 7：白名单可选）。
+
+        supported_versions 为空 = 不限制（任何公司开箱即用，
+        遇到新版本 docker run 自动拉镜像）；
+        配了白名单则严格校验（保守环境的运维管控）。
+        """
+        if not self.supported_versions:
+            return
+        if version not in self.supported_versions:
             raise InstallError(
                 f"版本 {version} 不在支持列表: {self.supported_versions}"
+                f"（config docker.supported_versions 为空则不限制）"
             )
 
     # ---------- 确保容器存在（核心方法，FP-01）----------
